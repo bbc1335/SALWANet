@@ -174,3 +174,48 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+
+# 忽略训练/测试数据、标注与可视化图片
+/annotations_*.json
+/classes*.txt
+/pictures/
+/ultralytics/cfg/datasets/BTW-DET.yaml
+/ultralytics/cfg/datasets/GC-DET.yaml
+/ultralytics/cfg/datasets/NEU-DET.yaml
+/ultralytics/cfg/datasets/aitod.yaml
+/ultralytics/cfg/datasets/dior.yaml
+
+# 忽略系统缓存目录
+~/.cache/
+~/.local/share/
+
+# 忽略项目特定目录
+build/
+dist/
+*.egg-info/
+
+# 忽略日志文件
+*.log
+logs/
+
+# 忽略环境文件
+.env
+.venv/
+venv/
+
+# 忽略IDE文件
+.trae/
+.vscode/
+.idea/
+*.swp
+
+analyze_class_similarity.py
+generate_filtered_annotations.py
+heatmap.py
+drawGT.py
+make_sci_figure.py
+make_waveds_spectral_figure.py
+test.py
+testFPS.py
+yolo2coco.py
+predict.py
