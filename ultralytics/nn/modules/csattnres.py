@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics.nn.modules import Conv, C3k2, C2f, Bottleneck, Focus, ChannelAttention
 
-from einops import rearrange
+# from einops import rearrange
 
 
 def dwt_init(x):
