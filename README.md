@@ -8,7 +8,7 @@
 
 </div>
 
-SALWANet 是论文《SALWANet: Scale-Aware Label Assignment and Wavelet-Attention for UAV Small Object Detection》的配套目标检测仓库（手稿编号 `PR-D-26-07642_R1`）。项目基于 [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) 二次开发，面向无人机（UAV）航拍影像中的小目标与密集目标检测，保留 Ultralytics 的训练、验证和推理接口，并提供 `n/s/m/l` 四种模型规模。
+SALWANet 是论文《SALWANet: Scale-Aware Label Assignment and Wavelet-Attention for UAV Small Object Detection》的配套目标检测仓库。项目基于 [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) 二次开发，面向无人机（UAV）航拍影像中的小目标与密集目标检测，保留 Ultralytics 的训练、验证和推理接口，并提供 `n/s/m/l` 四种模型规模。
 
 ## 环境与安装
 
