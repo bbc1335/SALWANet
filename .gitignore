@@ -219,3 +219,4 @@ test.py
 testFPS.py
 yolo2coco.py
 predict.py
+.gitignore
