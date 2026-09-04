@@ -9,11 +9,5 @@ for name in model_name:
                 epochs=300,
                 batch=8,
                 imgsz=640,
-                workers=8,
-                # save_period=1,
-                # optimizer="AdamW",
-                # lr0=0.001,
-                # resume=True,
-                project="runs/0830VisDrone",
-                name=f"VisDrone_DET_{name}_e300bs8sz640_k37"
+                workers=8
                 )
