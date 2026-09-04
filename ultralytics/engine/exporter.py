@@ -184,8 +184,7 @@ def best_onnx_opset(onnx, cuda=False) -> int:
 
 
 def validate_args(format, passed_args, valid_args):
-    """
-    Validate arguments based on the export format.
+    """Validate arguments based on the export format.
 
     Args:
         format (str): The export format.
@@ -233,14 +232,13 @@ def try_export(inner_func):
             return f
         except Exception as e:
             LOGGER.error(f"{prefix} export failure {dt.t:.1f}s: {e}")
-            raise e
+            raise
 
     return outer_func
 
 
 class Exporter:
-    """
-    A class for exporting YOLO models to various formats.
+    """A class for exporting YOLO models to various formats.
 
     This class provides functionality to export YOLO models to different formats including ONNX, TensorRT, CoreML,
     TensorFlow, and others. It handles format validation, device selection, model preparation, and the actual export
@@ -290,8 +288,7 @@ class Exporter:
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        """
-        Initialize the Exporter class.
+        """Initialize the Exporter class.
 
         Args:
             cfg (str, optional): Path to a configuration file.
@@ -1185,8 +1182,10 @@ class Exporter:
             LOGGER.info(f"\n{prefix} export requires Edge TPU compiler. Attempting install from {help_url}")
             for c in (
                 "curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -",
-                'echo "deb https://packages.cloud.google.com/apt coral-edgetpu-stable main" | '
-                "sudo tee /etc/apt/sources.list.d/coral-edgetpu.list",
+                (
+                    'echo "deb https://packages.cloud.google.com/apt coral-edgetpu-stable main" | '
+                    "sudo tee /etc/apt/sources.list.d/coral-edgetpu.list"
+                ),
                 "sudo apt-get update",
                 "sudo apt-get install edgetpu-compiler",
             ):
@@ -1422,8 +1421,7 @@ class IOSDetectModel(torch.nn.Module):
     """Wrap an Ultralytics YOLO model for Apple iOS CoreML export."""
 
     def __init__(self, model, im, mlprogram=True):
-        """
-        Initialize the IOSDetectModel class with a YOLO model and example image.
+        """Initialize the IOSDetectModel class with a YOLO model and example image.
 
         Args:
             model (torch.nn.Module): The YOLO model to wrap.
@@ -1457,8 +1455,7 @@ class NMSModel(torch.nn.Module):
     """Model wrapper with embedded NMS for Detect, Segment, Pose and OBB."""
 
     def __init__(self, model, args):
-        """
-        Initialize the NMSModel.
+        """Initialize the NMSModel.
 
         Args:
             model (torch.nn.Module): The model to wrap with NMS postprocessing.
@@ -1471,15 +1468,14 @@ class NMSModel(torch.nn.Module):
         self.is_tf = self.args.format in frozenset({"saved_model", "tflite", "tfjs"})
 
     def forward(self, x):
-        """
-        Perform inference with NMS post-processing. Supports Detect, Segment, OBB and Pose.
+        """Perform inference with NMS post-processing. Supports Detect, Segment, OBB and Pose.
 
         Args:
             x (torch.Tensor): The preprocessed tensor with shape (N, 3, H, W).
 
         Returns:
-            (torch.Tensor): List of detections, each an (N, max_det, 4 + 2 + extra_shape) Tensor where N is the
-                number of detections after NMS.
+            (torch.Tensor): List of detections, each an (N, max_det, 4 + 2 + extra_shape) Tensor where N is the number
+                of detections after NMS.
         """
         from functools import partial
 
@@ -1487,7 +1483,7 @@ class NMSModel(torch.nn.Module):
 
         preds = self.model(x)
         pred = preds[0] if isinstance(preds, tuple) else preds
-        kwargs = dict(device=pred.device, dtype=pred.dtype)
+        kwargs = {"device": pred.device, "dtype": pred.dtype}
         bs = pred.shape[0]
         pred = pred.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
         extra_shape = pred.shape[-1] - (4 + len(self.model.names))  # extras from Segment, OBB, Pose
