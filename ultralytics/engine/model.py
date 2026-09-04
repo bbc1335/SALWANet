@@ -86,73 +86,78 @@ class Model(torch.nn.Module):
         verbose: bool = False,
     ) -> None:
         """
-        Initialize a new instance of the YOLO model class.
+        初始化Model类实例，支持多种模型源和自动模型类型检测。
 
-        This constructor sets up the model based on the provided model path or name. It handles various types of
-        model sources, including local files, Ultralytics HUB models, and Triton Server models. The method
-        initializes several important attributes of the model and prepares it for operations like training,
-        prediction, or export.
+        该构造函数根据提供的模型路径或名称设置模型，处理多种类型的模型源：
+        - 本地文件（.pt权重文件或.yaml配置文件）
+        - Ultralytics HUB模型
+        - Triton Server模型
+        - 已初始化的Model实例
 
-        Args:
-            model (str | Path | Model): Path or name of the model to load or create. Can be a local file path, a
-                model name from Ultralytics HUB, a Triton Server model, or an already initialized Model instance.
-            task (str, optional): The specific task for the model. If None, it will be inferred from the config.
-            verbose (bool): If True, enables verbose output during the model's initialization and subsequent
-                operations.
+        参数:
+            model (str | Path | Model): 要加载或创建的模型路径、名称或已初始化的Model实例
+            task (str, optional): 模型任务类型（如'detect', 'segment', 'classify'等），若为None则自动推断
+            verbose (bool): 是否启用详细输出
 
-        Raises:
-            FileNotFoundError: If the specified model file does not exist or is inaccessible.
-            ValueError: If the model file or configuration is invalid or unsupported.
-            ImportError: If required dependencies for specific model types (like HUB SDK) are not installed.
+        异常:
+            FileNotFoundError: 模型文件不存在或无法访问时抛出
+            ValueError: 模型文件或配置无效或不支持时抛出
+            ImportError: 缺少特定模型类型所需的依赖项时抛出（如HUB SDK）
 
-        Examples:
-            >>> model = Model("yolo11n.pt")
-            >>> model = Model("path/to/model.yaml", task="detect")
-            >>> model = Model("hub_model", verbose=True)
+        示例:
+            >>> model = Model("yolo11n.pt")  # 加载预训练的YOLOv11n模型
+            >>> model = Model("path/to/model.yaml", task="detect")  # 从配置文件创建检测模型
+            >>> model = Model("hub_model", verbose=True)  # 加载Ultralytics HUB模型
         """
+        # 如果传入的是已初始化的Model实例，直接复制其属性并返回
         if isinstance(model, Model):
-            self.__dict__ = model.__dict__  # accepts an already initialized Model
+            self.__dict__ = model.__dict__  # 接受已初始化的Model实例
             return
+            
+        # 调用父类初始化
         super().__init__()
+        
+        # 初始化回调函数
         self.callbacks = callbacks.get_default_callbacks()
-        self.predictor = None  # reuse predictor
-        self.model = None  # model object
-        self.trainer = None  # trainer object
-        self.ckpt = {}  # if loaded from *.pt
-        self.cfg = None  # if loaded from *.yaml
-        self.ckpt_path = None
-        self.overrides = {}  # overrides for trainer object
-        self.metrics = None  # validation/training metrics
-        self.session = None  # HUB session
-        self.task = task  # task type
-        self.model_name = None  # model name
-        model = str(model).strip()
+        self.predictor = None  # 预测器对象，用于复用
+        self.model = None  # 实际的模型对象
+        self.trainer = None  # 训练器对象
+        self.ckpt = {}  # 从*.pt文件加载的检查点信息
+        self.cfg = None  # 从*.yaml文件加载的配置信息
+        self.ckpt_path = None  # 检查点文件路径
+        self.overrides = {}  # 训练器的配置覆盖
+        self.metrics = None  # 验证/训练指标
+        self.session = None  # HUB会话对象
+        self.task = task  # 任务类型
+        self.model_name = None  # 模型名称
+        model = str(model).strip()  # 转换为字符串并去除首尾空格
 
-        # Check if Ultralytics HUB model from https://hub.ultralytics.com
+        # 检查是否为Ultralytics HUB模型
         if self.is_hub_model(model):
             from ultralytics.hub import HUBTrainingSession
 
-            # Fetch model from HUB
-            checks.check_requirements("hub-sdk>=0.0.12")
-            session = HUBTrainingSession.create_session(model)
-            model = session.model_file
-            if session.train_args:  # training sent from HUB
-                self.session = session
+            # 从HUB获取模型
+            checks.check_requirements("hub-sdk>=0.0.12")  # 检查HUB SDK依赖
+            session = HUBTrainingSession.create_session(model)  # 创建HUB会话
+            model = session.model_file  # 获取模型文件路径
+            if session.train_args:  # 如果是从HUB发送的训练任务
+                self.session = session  # 保存会话信息
 
-        # Check if Triton Server model
+        # 检查是否为Triton Server模型
         elif self.is_triton_model(model):
-            self.model_name = self.model = model
-            self.overrides["task"] = task or "detect"  # set `task=detect` if not explicitly set
-            return
+            self.model_name = self.model = model  # 设置模型名称和对象
+            self.overrides["task"] = task or "detect"  # 设置默认任务类型为detect
+            return  # Triton模型初始化完成，直接返回
 
-        # Load or create new YOLO model
-        __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # to avoid deterministic warnings
+        # 加载或创建新的YOLO模型
+        __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # 设置CUDA环境变量避免确定性警告
         if str(model).endswith((".yaml", ".yml")):
-            self._new(model, task=task, verbose=verbose)
+            self._new(model, task=task, verbose=verbose)  # 从配置文件创建新模型
         else:
-            self._load(model, task=task)
+            self._load(model, task=task)  # 从权重文件加载已有模型
 
-        # Delete super().training for accessing self.model.training
+        # 删除父类的training属性，确保访问self.training时会路由到self.model.training
+        # 这是为了保持API一致性，使用户可以直接通过model.training访问模型的训练状态
         del self.training
 
     def __call__(
@@ -741,69 +746,91 @@ class Model(torch.nn.Module):
         **kwargs: Any,
     ):
         """
-        Train the model using the specified dataset and training configuration.
+        训练模型，支持自定义数据集和训练配置。
 
-        This method facilitates model training with a range of customizable settings. It supports training with a
-        custom trainer or the default training approach. The method handles scenarios such as resuming training
-        from a checkpoint, integrating with Ultralytics HUB, and updating model and configuration after training.
+        该方法提供了灵活的模型训练功能，支持自定义训练器或默认训练方式。它能处理多种训练场景：
+        - 从检查点恢复训练
+        - 与Ultralytics HUB集成
+        - 训练后自动更新模型和配置
 
-        When using Ultralytics HUB, if the session has a loaded model, the method prioritizes HUB training
-        arguments and warns if local arguments are provided. It checks for pip updates and combines default
-        configurations, method-specific defaults, and user-provided arguments to configure the training process.
+        当使用Ultralytics HUB时，如果会话已加载模型，方法会优先使用HUB的训练参数，并在提供本地参数时发出警告。
+        它会检查pip更新，然后合并默认配置、方法特定默认值和用户提供的参数来配置训练过程。
 
-        Args:
-            trainer (BaseTrainer, optional): Custom trainer instance for model training. If None, uses default.
-            **kwargs (Any): Arbitrary keyword arguments for training configuration. Common options include:
-                data (str): Path to dataset configuration file.
-                epochs (int): Number of training epochs.
-                batch (int): Batch size for training.
-                imgsz (int): Input image size.
-                device (str): Device to run training on (e.g., 'cuda', 'cpu').
-                workers (int): Number of worker threads for data loading.
-                optimizer (str): Optimizer to use for training.
-                lr0 (float): Initial learning rate.
-                patience (int): Epochs to wait for no observable improvement for early stopping of training.
+        参数:
+            trainer (BaseTrainer, optional): 用于模型训练的自定义训练器实例。如果为None，使用默认训练器。
+            **kwargs (Any): 用于训练配置的任意关键字参数。常用选项包括：
+                data (str): 数据集配置文件的路径。
+                epochs (int): 训练的轮次数。
+                batch (int): 训练的批大小。
+                imgsz (int): 输入图像的大小。
+                device (str): 运行训练的设备（例如 'cuda', 'cpu'）。
+                workers (int): 用于数据加载的工作线程数。
+                optimizer (str): 用于训练的优化器。
+                lr0 (float): 初始学习率。
+                patience (int): 早停训练的耐心值（无明显改进的轮次数）。
 
-        Returns:
-            (dict | None): Training metrics if available and training is successful; otherwise, None.
+        返回:
+            (dict | None): 如果训练成功且可用，则返回训练指标；否则返回None。
 
-        Examples:
+        示例:
             >>> model = YOLO("yolo11n.pt")
             >>> results = model.train(data="coco8.yaml", epochs=3)
         """
+        # 检查是否为PyTorch模型，确保只有PyTorch模型可以训练
         self._check_is_pytorch_model()
+
+        # 如果是Ultralytics HUB会话且已加载模型
         if hasattr(self.session, "model") and self.session.model.id:  # Ultralytics HUB session with loaded model
             if any(kwargs):
                 LOGGER.warning("using HUB training arguments, ignoring local training arguments.")
             kwargs = self.session.train_args  # overwrite kwargs
 
+        # 检查是否有可用的pip更新
         checks.check_pip_update_available()
 
+        # 如果提供了预训练权重路径，加载预训练权重
         if isinstance(kwargs.get("pretrained", None), (str, Path)):
             self.load(kwargs["pretrained"])  # load pretrained weights if provided
+        # 加载配置文件（如果提供），否则使用当前覆盖配置
         overrides = YAML.load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
+         # 设置方法默认参数 - 处理data参数的优先级：配置文件 > 默认配置 > 任务对应默认数据
         custom = {
-            # NOTE: handle the case when 'cfg' includes 'data'.
+            # NOTE: 处理配置文件中包含'data'的情况，确保data参数有合理的默认值
             "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
-            "model": self.overrides["model"],
-            "task": self.task,
-        }  # method defaults
+            "model": self.overrides["model"],  # 使用当前任务类型
+            "task": self.task,  # 使用当前任务类型
+        }  # 方法级别的默认参数
+        
+        # 合并参数：优先级从左到右递增（用户参数优先级最高）
         args = {**overrides, **custom, **kwargs, "mode": "train", "session": self.session}  # prioritizes rightmost args
+        
+        # 如果设置了恢复训练，使用当前检查点路径
         if args.get("resume"):
             args["resume"] = self.ckpt_path
 
+        # 初始化训练器：使用自定义训练器或智能加载的默认训练器
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
+        
+        # 如果不是恢复训练，手动设置模型（恢复训练时模型会从检查点加载）
         if not args.get("resume"):  # manually set model only if not resuming
+            # 获取模型，加载权重（如果有）和配置
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
-            self.model = self.trainer.model
+            self.model = self.trainer.model  # 更新当前实例的模型引用
 
+        # 开始训练过程
         self.trainer.train()
-        # Update model and cfg after training
+        
+        # 训练后更新模型和配置（仅在主进程或非分布式环境中执行）
         if RANK in {-1, 0}:
+            # 选择最佳模型（如果存在），否则使用最后一个检查点
             ckpt = self.trainer.best if self.trainer.best.exists() else self.trainer.last
+            # 加载训练后的模型和检查点信息
             self.model, self.ckpt = load_checkpoint(ckpt)
+            # 重置检查点参数，确保配置与训练后的模型一致
             self.overrides = self._reset_ckpt_args(self.model.args)
+            # 获取验证指标（DDP模式下可能无法获取，因此添加TODO注释）
             self.metrics = getattr(self.trainer.validator, "metrics", None)  # TODO: no metrics returned by DDP
+        # 返回训练指标
         return self.metrics
 
     def tune(
@@ -1067,31 +1094,39 @@ class Model(torch.nn.Module):
 
     def _smart_load(self, key: str):
         """
-        Intelligently load the appropriate module based on the model task.
+        智能加载与模型任务对应的适当模块。
+    
+        该方法根据当前模型的任务类型和提供的键值，动态选择并返回正确的模块（模型、训练器、验证器或预测器）。
+        使用 task_map 字典来确定特定任务应加载的适当模块。
 
-        This method dynamically selects and returns the correct module (model, trainer, validator, or predictor)
-        based on the current task of the model and the provided key. It uses the task_map dictionary to determine
-        the appropriate module to load for the specific task.
+        参数:
+            key (str): 要加载的模块类型。必须是 'model'、'trainer'、'validator' 或 'predictor' 之一。
 
-        Args:
-            key (str): The type of module to load. Must be one of 'model', 'trainer', 'validator', or 'predictor'.
+        返回:
+            (object): 与指定键和当前任务对应的加载的模块类。
 
-        Returns:
-            (object): The loaded module class corresponding to the specified key and current task.
+        异常:
+            NotImplementedError: 如果当前任务不支持指定的键，则抛出此异常。
 
-        Raises:
-            NotImplementedError: If the specified key is not supported for the current task.
-
-        Examples:
+        示例:
             >>> model = Model(task="detect")
-            >>> predictor_class = model._smart_load("predictor")
-            >>> trainer_class = model._smart_load("trainer")
+            >>> predictor_class = model._smart_load("predictor")  # 加载检测任务的预测器类
+            >>> trainer_class = model._smart_load("trainer")      # 加载检测任务的训练器类
         """
         try:
+            # 从 task_map 字典中获取当前任务对应的模块映射
+            # self.task_map: 存储任务类型到各模块类的映射关系的字典
+            # self.task: 当前模型的任务类型（如 'detect', 'segment', 'classify' 等）
+            # key: 要加载的模块类型（'model', 'trainer', 'validator' 或 'predictor'）
             return self.task_map[self.task][key]
         except Exception as e:
+            # 获取当前类名，用于异常信息
             name = self.__class__.__name__
+             # 获取调用当前方法的函数名，用于异常信息
+            # inspect.stack()[1][3]: 访问调用堆栈，获取上一级函数名
             mode = inspect.stack()[1][3]  # get the function name.
+            # 抛出 NotImplementedError 异常，包含详细的错误信息
+            # 格式为：'Model' model does not support 'predict' mode for 'detect' task.
             raise NotImplementedError(f"'{name}' model does not support '{mode}' mode for '{self.task}' task.") from e
 
     @property

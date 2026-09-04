@@ -260,15 +260,21 @@ class BaseTrainer:
         )
 
     def _setup_train(self):
-        """Build dataloaders and optimizer on correct rank process."""
+        """在正确的进程上构建数据加载器和优化器，配置完整的训练环境。"""
+        # 加载模型检查点
         ckpt = self.setup_model()
+        
+        # 将模型移动到指定设备（CPU/GPU）
         self.model = self.model.to(self.device)
+        
+        # 设置模型属性（如类别数量、锚点等）
         self.set_model_attributes()
 
-        # Compile model
+        # 编译模型以提高性能（如果支持）
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 
-        # Freeze layers
+        # 冻结层配置
+        # 处理冻结参数：如果是整数则转换为范围，否则保持列表或空列表
         freeze_list = (
             self.args.freeze
             if isinstance(self.args.freeze, list)
@@ -276,69 +282,106 @@ class BaseTrainer:
             if isinstance(self.args.freeze, int)
             else []
         )
+        
+        # 总是需要冻结的层名称（目前只有.dfl层）
         always_freeze_names = [".dfl"]  # always freeze these layers
+        
+        # 合并所有需要冻结的层名称模式
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         self.freeze_layer_names = freeze_layer_names
+        
+        # 遍历模型所有参数并根据配置冻结
         for k, v in self.model.named_parameters():
-            # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+            # v.register_hook(lambda x: torch.nan_to_num(x))  # 注释掉的代码：将NaN转换为0（可能导致训练不稳定）
+            
+            # 如果参数名称包含任何需要冻结的模式
             if any(x in k for x in freeze_layer_names):
-                LOGGER.info(f"Freezing layer '{k}'")
+                LOGGER.info(f"冻结层 '{k}'")
                 v.requires_grad = False
-            elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
+            # 如果参数是浮点型但requires_grad为False，则发出警告并设置为True
+            elif not v.requires_grad and v.dtype.is_floating_point:
                 LOGGER.warning(
-                    f"setting 'requires_grad=True' for frozen layer '{k}'. "
-                    "See ultralytics.engine.trainer for customization of frozen layers."
+                    f"为冻结层 '{k}' 设置 'requires_grad=True'。"
+                    "请参考ultralytics.engine.trainer以自定义冻结层。"
                 )
                 v.requires_grad = True
 
-        # Check AMP
-        self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
-        if self.amp and RANK in {-1, 0}:  # Single-GPU and DDP
-            callbacks_backup = callbacks.default_callbacks.copy()  # backup callbacks as check_amp() resets them
+        # 检查并配置AMP（自动混合精度训练）
+        self.amp = torch.tensor(self.args.amp).to(self.device)  # True或False
+        
+        # 在单GPU或DDP的rank 0上检查AMP支持
+        if self.amp and RANK in {-1, 0}:
+            callbacks_backup = callbacks.default_callbacks.copy()  # 备份回调，因为check_amp()会重置它们
             self.amp = torch.tensor(check_amp(self.model), device=self.device)
-            callbacks.default_callbacks = callbacks_backup  # restore callbacks
-        if RANK > -1 and self.world_size > 1:  # DDP
-            dist.broadcast(self.amp.int(), src=0)  # broadcast from rank 0 to all other ranks; gloo errors with boolean
-        self.amp = bool(self.amp)  # as boolean
+            callbacks.default_callbacks = callbacks_backup  # 恢复回调
+        
+        # DDP环境下，从rank 0广播AMP设置到所有其他rank
+        if RANK > -1 and self.world_size > 1:
+            dist.broadcast(self.amp.int(), src=0)  # 使用int类型广播，避免gloo后端的布尔类型错误
+        
+        self.amp = bool(self.amp)  # 转换为布尔类型
+        # 根据PyTorch版本创建GradScaler
         self.scaler = (
             torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
         )
+        
+        # DDP环境下，将模型包装为DistributedDataParallel
         if self.world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
 
-        # Check imgsz
-        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
+        # 检查并调整输入图像大小
+        # 获取模型的最大步长（用于网格大小计算）
+        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)
+        # 确保图像大小是步长的倍数
         self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
-        self.stride = gs  # for multiscale training
+        self.stride = gs  # 用于多尺度训练
 
-        # Batch size
-        if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
+        # 批处理大小配置
+        if self.batch_size < 1 and RANK == -1:  # 仅单GPU模式下，自动估算最佳批处理大小
             self.args.batch = self.batch_size = self.auto_batch()
 
-        # Dataloaders
+        # 构建数据加载器
+        # 计算每个进程的批处理大小
         batch_size = self.batch_size // max(self.world_size, 1)
+        
+        # 创建训练数据加载器
         self.train_loader = self.get_dataloader(
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
         )
-        # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
+        
+        # 创建验证数据加载器（OBB任务保持相同批大小，其他任务批大小翻倍）
         self.test_loader = self.get_dataloader(
             self.data.get("val") or self.data.get("test"),
             batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
             rank=LOCAL_RANK,
             mode="val",
         )
+        
+        # 获取验证器实例
         self.validator = self.get_validator()
+        
+        # 初始化模型EMA（指数移动平均）
         self.ema = ModelEMA(self.model)
+        
+        # 在主进程上设置指标和绘制训练标签
         if RANK in {-1, 0}:
+            # 合并验证指标和损失指标键
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
+            
+            # 如果需要绘制标签分布
             if self.args.plots:
                 self.plot_training_labels()
 
-        # Optimizer
-        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
-        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
+        # 构建优化器
+        # 计算梯度累积步数：确保总有效批量大小接近nbs（标称批量大小）
+        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)
+        # 按比例缩放权重衰减
+        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs
+        # 计算总迭代次数
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        
+        # 构建优化器
         self.optimizer = self.build_optimizer(
             model=self.model,
             name=self.args.optimizer,
@@ -347,182 +390,234 @@ class BaseTrainer:
             decay=weight_decay,
             iterations=iterations,
         )
-        # Scheduler
+        
+        # 设置学习率调度器
         self._setup_scheduler()
+        
+        # 初始化早停机制
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
+        
+        # 恢复训练（如果有检查点）
         self.resume_training(ckpt)
+        
+        # 设置调度器的起始迭代次数
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
+        
+        # 调用训练前准备完成的回调
         self.run_callbacks("on_pretrain_routine_end")
 
     def _do_train(self):
-        """Train the model with the specified world size."""
+        """
+        执行模型训练的主循环，包含epoch迭代、batch处理、损失计算、优化器更新等完整训练流程。
+        """
         if self.world_size > 1:
-            self._setup_ddp()
-        self._setup_train()
+            self._setup_ddp()  # 如果使用分布式训练，设置DDP环境
+        self._setup_train()  # 设置训练环境，包括数据加载器、优化器等
 
-        nb = len(self.train_loader)  # number of batches
-        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
-        last_opt_step = -1
-        self.epoch_time = None
-        self.epoch_time_start = time.time()
-        self.train_time_start = time.time()
-        self.run_callbacks("on_train_start")
+        nb = len(self.train_loader)  # 获取训练数据的批次数
+        # 计算warmup迭代次数：如果设置了warmup_epochs，则为warmup_epochs * 批次数，否则为-1
+        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1
+        last_opt_step = -1  # 记录上一次优化器更新的迭代步数
+        self.epoch_time = None  # 记录每个epoch的训练时间
+        self.epoch_time_start = time.time()  # 记录训练开始时间
+        self.train_time_start = time.time()  # 记录训练总时间开始时间
+        self.run_callbacks("on_train_start")  # 运行训练开始回调
+
+        # 记录训练配置信息
         LOGGER.info(
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
             f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
             f"Logging results to {colorstr('bold', self.save_dir)}\n"
             f"Starting training for " + (f"{self.args.time} hours..." if self.args.time else f"{self.epochs} epochs...")
         )
+
+        # 如果设置了关闭mosaic增强，计算关闭mosaic的索引位置
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
-        epoch = self.start_epoch
-        self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
+        
+        epoch = self.start_epoch  # 从指定的起始epoch开始训练
+        self.optimizer.zero_grad()  # 清除可能残留的梯度，确保训练开始时的稳定性
+
+        # 训练主循环
         while True:
-            self.epoch = epoch
-            self.run_callbacks("on_train_epoch_start")
+            self.epoch = epoch  # 设置当前epoch
+            self.run_callbacks("on_train_epoch_start")  # 运行epoch开始回调
+
+            # 忽略"Detected lr_scheduler.step() before optimizer.step()"警告
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
-                self.scheduler.step()
+                warnings.simplefilter("ignore")
+                self.scheduler.step()  # 更新学习率调度器
 
-            self._model_train()
+            self._model_train()  # 设置模型为训练模式
             if RANK != -1:
-                self.train_loader.sampler.set_epoch(epoch)
-            pbar = enumerate(self.train_loader)
-            # Update dataloader attributes (optional)
-            if epoch == (self.epochs - self.args.close_mosaic):
-                self._close_dataloader_mosaic()
-                self.train_loader.reset()
+                self.train_loader.sampler.set_epoch(epoch)  # 设置DDP采样器的epoch，确保数据打乱的一致性
 
+            pbar = enumerate(self.train_loader)  # 获取训练数据迭代器
+            # 当epoch达到关闭mosaic的 epoch时，更新数据加载器的mosaic增强配置
+            if epoch == (self.epochs - self.args.close_mosaic):
+                self._close_dataloader_mosaic()  # 关闭mosaic增强
+                self.train_loader.reset()  # 重置数据加载器
+
+            # 在主进程中初始化进度条
             if RANK in {-1, 0}:
-                LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
-            self.tloss = None
-            for i, batch in pbar:
-                self.run_callbacks("on_train_batch_start")
-                # Warmup
-                ni = i + nb * epoch
+                LOGGER.info(self.progress_string())  # 记录训练进度字符串
+                pbar = TQDM(enumerate(self.train_loader), total=nb)  # 使用TQDM显示进度条
+            
+            self.tloss = None  # 初始化总损失
+            for i, batch in pbar:  # 遍历每个batch
+                self.run_callbacks("on_train_batch_start")  # 运行batch开始回调
+                
+                # Warmup学习率和动量调整
+                ni = i + nb * epoch  # 当前总的迭代步数
                 if ni <= nw:
-                    xi = [0, nw]  # x interp
+                    xi = [0, nw]  # x插值区间
+                    # 计算梯度累积步数：从1线性增加到 nbs/batch_size
                     self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
                     for j, x in enumerate(self.optimizer.param_groups):
-                        # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                        # 偏置项学习率从0.1降到lr0，其他参数学习率从0.0升到lr0
                         x["lr"] = np.interp(
                             ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
                         )
+                        # 动量从warmup_momentum升到args.momentum
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
-                # Forward
-                with autocast(self.amp):
-                    batch = self.preprocess_batch(batch)
+                # 前向传播计算损失
+                with autocast(self.amp):  # 自动混合精度训练
+                    batch = self.preprocess_batch(batch)  # 预处理batch数据
                     if self.args.compile:
-                        # Decouple inference and loss calculations for improved compile performance
-                        preds = self.model(batch["img"])
-                        loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                        # 编译模式下：分离推理和损失计算以提高性能
+                        preds = self.model(batch["img"])  # 模型推理得到预测结果
+                        loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)  # 计算损失
                     else:
+                        # 非编译模式下：直接调用模型得到损失
                         loss, self.loss_items = self.model(batch)
-                    self.loss = loss.sum()
+                    
+                    self.loss = loss.sum()  # 计算总损失
                     if RANK != -1:
-                        self.loss *= self.world_size
+                        self.loss *= self.world_size  # 分布式训练时，损失需要乘以world_size
+                    
+                    # 更新总损失（加权平均）
                     self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
 
-                # Backward
-                self.scaler.scale(self.loss).backward()
+                # 反向传播
+                self.scaler.scale(self.loss).backward()  # 使用梯度缩放进行反向传播
+                
+                # 当达到累积步数时，更新优化器
                 if ni - last_opt_step >= self.accumulate:
-                    self.optimizer_step()
-                    last_opt_step = ni
+                    self.optimizer_step()  # 更新优化器参数
+                    last_opt_step = ni  # 记录当前优化器更新的步数
 
-                    # Timed stopping
+                    # 如果设置了训练时间限制，检查是否超时
                     if self.args.time:
                         self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
-                        if RANK != -1:  # if DDP training
+                        if RANK != -1:  # 分布式训练时，广播stop状态
                             broadcast_list = [self.stop if RANK == 0 else None]
-                            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+                            dist.broadcast_object_list(broadcast_list, 0)
                             self.stop = broadcast_list[0]
-                        if self.stop:  # training time exceeded
+                        if self.stop:  # 训练时间超过限制，停止训练
                             break
 
-                # Log
+                # 日志记录
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                    # 更新进度条显示
                     pbar.set_description(
                         ("%11s" * 2 + "%11.4g" * (2 + loss_length))
                         % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
+                            f"{epoch + 1}/{self.epochs}",  # 当前epoch/总epoch
+                            f"{self._get_memory():.3g}G",  # GPU内存使用情况
+                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # 损失值
+                            batch["cls"].shape[0],  # batch大小
+                            batch["img"].shape[-1],  # 图像大小
                         )
                     )
-                    self.run_callbacks("on_batch_end")
+                    self.run_callbacks("on_batch_end")  # 运行batch结束回调
+                    
+                    # 如果当前迭代步数在plot_idx中，绘制训练样本
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
 
-                self.run_callbacks("on_train_batch_end")
+                self.run_callbacks("on_train_batch_end")  # 运行训练batch结束回调
 
-            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
+            # 记录学习率，用于日志记录
+            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}
 
-            self.run_callbacks("on_train_epoch_end")
+            self.run_callbacks("on_train_epoch_end")  # 运行epoch结束回调
+            
+            # 在主进程中更新EMA模型
             if RANK in {-1, 0}:
-                final_epoch = epoch + 1 >= self.epochs
+                final_epoch = epoch + 1 >= self.epochs  # 判断是否为最后一个epoch
+                # 更新EMA模型的属性
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
-            # Validation
+            # 验证阶段：在指定条件下进行验证
             if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                self._clear_memory(threshold=0.5)  # prevent VRAM spike
-                self.metrics, self.fitness = self.validate()
+                self._clear_memory(threshold=0.5)  # 清除内存，防止验证时VRAM峰值
+                self.metrics, self.fitness = self.validate()  # 执行验证，获取指标和适应度值
 
-            # NaN recovery
+            # 处理NaN值恢复
             if self._handle_nan_recovery(epoch):
-                continue
+                continue  # 如果发生NaN恢复，跳过当前epoch的后续处理
 
-            self.nan_recovery_attempts = 0
+            self.nan_recovery_attempts = 0  # 重置NaN恢复尝试次数
             if RANK in {-1, 0}:
+                # 保存训练指标
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                # 判断是否停止训练：早停条件满足或达到最后一个epoch
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
+                # 如果设置了训练时间限制，检查是否超时
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
-                # Save model
+                # 保存模型：在指定条件下保存模型
                 if self.args.save or final_epoch:
-                    self.save_model()
-                    self.run_callbacks("on_model_save")
+                    self.save_model()  # 保存模型
+                    self.run_callbacks("on_model_save")  # 运行模型保存回调
 
-            # Scheduler
+            # 学习率调度和时间调整
             t = time.time()
-            self.epoch_time = t - self.epoch_time_start
-            self.epoch_time_start = t
+            self.epoch_time = t - self.epoch_time_start  # 记录当前epoch的训练时间
+            self.epoch_time_start = t  # 重置epoch开始时间
             if self.args.time:
+                # 根据平均epoch时间调整总epoch数
                 mean_epoch_time = (t - self.train_time_start) / (epoch - self.start_epoch + 1)
                 self.epochs = self.args.epochs = math.ceil(self.args.time * 3600 / mean_epoch_time)
-                self._setup_scheduler()
-                self.scheduler.last_epoch = self.epoch  # do not move
-                self.stop |= epoch >= self.epochs  # stop if exceeded epochs
-            self.run_callbacks("on_fit_epoch_end")
-            self._clear_memory(0.5)  # clear if memory utilization > 50%
+                self._setup_scheduler()  # 重新设置学习率调度器
+                self.scheduler.last_epoch = self.epoch  # 保持调度器的last_epoch不变
+                self.stop |= epoch >= self.epochs  # 如果超过了计算的总epoch数，停止训练
+            
+            self.run_callbacks("on_fit_epoch_end")  # 运行fit epoch结束回调
+            self._clear_memory(0.5)  # 如果内存利用率超过50%，清除内存
 
-            # Early Stopping
-            if RANK != -1:  # if DDP training
+            # 分布式训练时，广播stop状态
+            if RANK != -1:
                 broadcast_list = [self.stop if RANK == 0 else None]
-                dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+                dist.broadcast_object_list(broadcast_list, 0)
                 self.stop = broadcast_list[0]
+            
+            # 如果满足停止条件，退出训练循环
             if self.stop:
-                break  # must break all DDP ranks
-            epoch += 1
+                break  # 必须中断所有DDP进程的训练循环
+            epoch += 1  # 进入下一个epoch
 
+        # 计算并记录总训练时间
         seconds = time.time() - self.train_time_start
         LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
-        # Do final val with best.pt
+        
+        # 使用best.pt进行最终验证
         self.final_eval()
+        
         if RANK in {-1, 0}:
+            # 如果设置了绘图，绘制训练指标
             if self.args.plots:
                 self.plot_metrics()
-            self.run_callbacks("on_train_end")
-        self._clear_memory()
-        unset_deterministic()
-        self.run_callbacks("teardown")
+            self.run_callbacks("on_train_end")  # 运行训练结束回调
+        
+        self._clear_memory()  # 清除所有内存
+        unset_deterministic()  # 取消确定性模式
+        self.run_callbacks("teardown")  # 运行清理回调
 
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""

@@ -3,6 +3,8 @@
 from .tasks import (
     BaseModel,
     ClassificationModel,
+    SSTNModel,
+    HCSYOLOModel,
     DetectionModel,
     SegmentationModel,
     guess_model_scale,
@@ -16,6 +18,8 @@ from .tasks import (
 __all__ = (
     "BaseModel",
     "ClassificationModel",
+    "SSTNModel",
+    "HCSYOLOModel",
     "DetectionModel",
     "SegmentationModel",
     "guess_model_scale",

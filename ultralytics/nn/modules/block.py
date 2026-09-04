@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad, h_sigmoid
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -32,6 +32,7 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
+    "C2fk",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -52,7 +53,190 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "FEM",
+    "HTEM",
+    "Fusion_2in_mod",
+    "GatedSPPF",
 )
+
+
+class GatedSPPF(nn.Module):
+    """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
+
+    def __init__(self, c1, c2, k=5):
+        """
+        Initializes the SPPF layer with given input/output channels and kernel size.
+
+        This module is equivalent to SPP(k=(5, 9, 13)).
+        """
+        super().__init__()
+        self.epsilon = 1e-4
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.w = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
+
+    def forward(self, x):
+        """Forward pass through Ghost Convolution block."""
+        y = [self.cv1(x)]
+        weight = F.silu(self.w)
+        weight = weight / (torch.sum(weight, dim=0) + self.epsilon)
+        y.extend(weight[_] * self.m(y[-1]) for _ in range(3))
+        return self.cv2((torch.cat(y, 1)))
+
+
+class Bottleneck1(nn.Module):
+    """Standard bottleneck."""
+
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        """Initializes a bottleneck module with given input/output channels, shortcut option, group, kernels, and
+        expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv0 = Conv(c1, c_, 1, 1)
+        self.cv1 = Conv(c_, c_, k[0], 1, g=g)
+        self.cv2 = Conv(c_, c2, k[1], 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        """'forward()' applies the YOLO FPN to input data."""
+        return x + self.cv2(self.cv1(self.cv0(x))) if self.add else self.cv2(self.cv1(x))
+
+
+class C2fk(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, kl=3, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(
+            Bottleneck1(self.c, self.c, shortcut, self.c, k=((kl, kl), (1, 1)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class HTEMBranch(nn.Module):
+    def __init__(self, c1, c2, i):
+        super(HTEMBranch, self).__init__()
+        self.branch1_0 = Conv(c1, c2, 1)
+        self.branch1_1 = nn.Sequential(
+            Conv(c2, c2, k=(1, i), p=(0, i // 2)),
+            Conv(c2, c2, k=(i, 1), p=(i // 2, 0))
+        )
+        self.branch1_2 = nn.Sequential(
+            Conv(c2, c2, k=(i, 1), p=(i // 2, 0)),
+            Conv(c2, c2, k=(1, i), p=(0, i // 2))
+        )
+        self.branch1_3 = Conv(c2 * 2, c1, 1)
+        self.branch1_4 = Conv(c1, c1, 3, p=i, d=i)
+
+    def forward(self, x):
+        x1_0 = self.branch1_0(x[0] + x[1])
+        x1_1 = self.branch1_1(x1_0)
+        x1_2 = self.branch1_2(x1_0)
+        x1_3 = self.branch1_3(torch.cat((x1_1, x1_2), dim=1))
+        x1 = self.branch1_4(x1_3)
+        return x1
+
+
+class HTEM(nn.Module):
+    # Revised from: Exploring Dense Context for Salient Object Detection, 2022, TCSVT
+    def __init__(self, in_channel, out_channel):
+        super(HTEM, self).__init__()
+        self.branch0 = Conv(in_channel // 2, in_channel // 2, 1)
+
+        self.branch1 = HTEMBranch(in_channel // 2, 2 * in_channel, 3)
+
+        self.branch2 = HTEMBranch(in_channel // 2, 2 * in_channel, 5)
+
+        self.branch3 = HTEMBranch(in_channel // 2, 2 * in_channel, 7)
+
+        self.branch4 = HTEMBranch(in_channel // 2, 2 * in_channel, 9)
+
+        self.conv_cat = Conv(in_channel * 5 // 2, out_channel, 3, 1)
+
+    def forward(self, x):
+        x = list(torch.chunk(x, 2, 1))
+        x0 = self.branch0(x[0])
+        x1 = self.branch1([x0, x[1]])
+        x2 = self.branch2([x1, x[1]])
+        x3 = self.branch3([x2, x[1]])
+        x4 = self.branch4([x3, x[1]])
+
+        x_cat = torch.cat((x0, x1, x2, x3, x4), dim=1)
+        x_out = self.conv_cat(x_cat)
+
+        return x_out
+
+
+class Fusion_2in_mod(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.local_embedding = Conv(c1[0], c2, 1, act=False)
+        self.global_embedding = Conv(c1[1], c2, 1, act=False)
+        self.global_act = Conv(c1[1], c2, 1, act=False)
+        self.act = h_sigmoid()
+
+    def forward(self, x):
+        B, C, H, W = x[1].shape
+        x0 = F.interpolate(x[0], size=(H, W), mode='bilinear', align_corners=False)
+        x_l = self.local_embedding(x0)
+        
+        x_g = self.global_embedding(x[1])
+        x_g_act = self.global_act(x[1])
+
+        out = x_l * self.act(x_g_act) + x_g
+        return out
+
+
+class FEM(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.q_embedding = Conv(c1[1], c2, 1)
+        self.k_embedding = Conv(c1[0], c2, 1)
+        self.v_embedding = Conv(c1[0], c2, 1)
+        
+        self.trans = Conv(c2, c2, 1)
+
+    def forward(self, x):
+        _, _, H1, W1 = x[0].shape
+        
+        x_q = F.interpolate(x[1], size=(H1, W1), mode='bilinear', align_corners=False)
+        x_q = self.q_embedding(x_q)
+        B, C, H, W = x_q.shape
+        x_q = x_q.view(B, C, -1)  # Flatten the spatial dimensions
+        
+        x_k = self.k_embedding(x[0]).view(B, C, -1)  # Flatten the spatial dimensions
+        x_k = x_k.permute(0, 2, 1)  # Change shape to (B, H*W, C)
+        
+        x_v = self.v_embedding(x[0]).view(B, C, -1)  # Flatten the spatial dimensions
+        x_v = x_v.permute(0, 2, 1)  # Change shape to (B, H*W, C)
+
+        atten = torch.matmul(x_k, x_q)  # Matrix multiplication for attention scores
+        atten = F.softmax(atten, dim=-1)  # Apply softmax to get attention weights
+        x_out = torch.matmul(atten, x_v)
+        x_out = x_out.permute(0, 2, 1).view(B, C, H, W)
+        
+        x_out = self.trans(x_out) + x[0]
+        
+        return x_out
 
 
 class DFL(nn.Module):
@@ -219,7 +403,7 @@ class SPPF(nn.Module):
     def __init__(self, c1: int, c2: int, k: int = 5):
         """
         Initialize the SPPF layer with given input/output channels and kernel size.
-
+C3Ghos
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.

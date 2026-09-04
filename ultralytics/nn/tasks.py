@@ -30,6 +30,13 @@ from ultralytics.nn.modules import (
     Bottleneck,
     BottleneckCSP,
     C2f,
+    C2fk,
+    C2f_AttnRes,
+    C3k2_AttnRes,
+    # C2fSDSA,
+    WaveletDownsample,
+    WaveletDownsample1,
+    CS_AttnRes_Neck,
     C2fAttn,
     C2fCIB,
     C2fPSA,
@@ -43,10 +50,12 @@ from ultralytics.nn.modules import (
     Conv,
     Conv2,
     ConvTranspose,
+    CPSBlock,
     Detect,
     DWConv,
     DWConvTranspose2d,
     Focus,
+    FBDM,
     GhostBottleneck,
     GhostConv,
     HGBlock,
@@ -64,17 +73,26 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     TorchVision,
+    FEM,
+    HTEM,
+    Fusion_2in_mod,
+    GatedSPPF,
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
 )
+from ultralytics.nn.modules.csattnres import WaveletDownsample2
+from ultralytics.nn.modules.scjw import SCJW
+from ultralytics.nn.modules.sstm import SSTM
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2EDetectLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
+    SSTNDetectionLoss,
+    HCSYOLOLoss,
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -499,6 +517,373 @@ class DetectionModel(BaseModel):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
+
+class SSTNModel(BaseModel):
+    """
+    Self-supervised Tuning Network Model for YOLO detection.
+
+    This class implements the YOLO detection architecture, handling model initialization, forward pass,
+    augmented inference, and loss computation for object detection tasks.
+
+    Attributes:
+        yaml (dict): Model configuration dictionary.
+        model (torch.nn.Sequential): The neural network model.
+        save (list): List of layer indices to save outputs from.
+        names (dict): Class names dictionary.
+        inplace (bool): Whether to use inplace operations.
+        end2end (bool): Whether the model uses end-to-end detection.
+        stride (torch.Tensor): Model stride values.
+
+    Methods:
+        __init__: Initialize the YOLO detection model.
+        _predict_augment: Perform augmented inference.
+        _descale_pred: De-scale predictions following augmented inference.
+        _clip_augmented: Clip YOLO augmented inference tails.
+        init_criterion: Initialize the loss criterion.
+
+    Examples:
+        Initialize a detection model
+        >>> model = DetectionModel("yolo11n.yaml", ch=3, nc=80)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
+        """
+        Initialize the YOLO detection model with the given config and parameters.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Whether to display model information.
+        """
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        # Define model
+        self.yaml["channels"] = ch  # save channels
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
+        self.end2end = getattr(self.model[-1], "end2end", False)
+
+        # Build strides
+        m = self.model[-1]  # Detect()
+        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+
+            def _forward(x):
+                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
+                if self.end2end:
+                    return self.forward(x)["one2many"]
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+
+            self.model.eval()  # Avoid changing batch statistics until training begins
+            m.training = True  # Setting it to True to properly return strides
+            m.stride = torch.tensor([s / x.shape[-2] for x in (_forward((torch.zeros(1, ch, s, s), torch.zeros(1, 1, s, s))))[0]])  # forward
+            self.stride = m.stride
+            self.model.train()  # Set model back to training(default) mode
+            m.bias_init()  # only run once
+        else:
+            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+
+        # Init weights, biases
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+    
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool): Print the computation time of each layer if True.
+            visualize (bool): Save the feature maps of the model if True.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        if self.training:
+            x, mask = x[0], x[1]
+        y, dt, embeddings = [], [], []  # outputs
+        embed = frozenset(embed) if embed is not None else {-1}
+        max_idx = max(embed)
+        self_loss_total = 0.0
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            
+            # 检测是否为SSTM层并传递标签数据
+            if m.training and hasattr(m, "__class__") and m.__class__.__name__ == "SSTM" and mask is not None:
+                x, self_loss = m(x, mask)
+                # x, self_loss = m(x)
+                self_loss_total += self_loss
+            elif m.training and hasattr(m, "__class__") and m.__class__.__name__ == "FBDM" and mask is not None:
+                x, self_loss = m(x, mask)   
+                self_loss_total += self_loss
+            # elif m.training and hasattr(m, "__class__") and m.__class__.__name__ == "SCJW":
+            #     x = m(x, mask)
+            # elif m.training and hasattr(m, "__class__") and m.__class__.__name__ == "CPSBlock":
+            #     x = m(x, mask)
+            else:
+                x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if m.i in embed:
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max_idx:
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        
+        if self.training:
+            return x, self_loss_total
+            # return x
+        else:
+            return x
+    
+    def loss(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on.
+            preds (torch.Tensor | list[torch.Tensor], optional): Predictions.
+        """
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        if preds is None:
+            preds, self_loss = self.forward((batch["img"], batch['mask']))
+        else:
+            self_loss = None  # During validation, self_loss is not computed
+        return self.criterion((preds, self_loss), batch)
+
+    def _predict_augment(self, x):
+        """
+        Perform augmentations on input image x and return augmented inference and train outputs.
+
+        Args:
+            x (torch.Tensor): Input image tensor.
+
+        Returns:
+            (torch.Tensor): Augmented inference output.
+        """
+        if getattr(self, "end2end", False) or self.__class__.__name__ != "DetectionModel":
+            LOGGER.warning("Model does not support 'augment=True', reverting to single-scale prediction.")
+            return self._predict_once(x)
+        img_size = x.shape[-2:]  # height, width
+        s = [1, 0.83, 0.67]  # scales
+        f = [None, 3, None]  # flips (2-ud, 3-lr)
+        y = []  # outputs
+        for si, fi in zip(s, f):
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            yi = super().predict(xi)[0]  # forward
+            yi = self._descale_pred(yi, fi, si, img_size)
+            y.append(yi)
+        y = self._clip_augmented(y)  # clip augmented tails
+        return torch.cat(y, -1), None  # augmented inference, train
+
+    @staticmethod
+    def _descale_pred(p, flips, scale, img_size, dim=1):
+        """
+        De-scale predictions following augmented inference (inverse operation).
+
+        Args:
+            p (torch.Tensor): Predictions tensor.
+            flips (int): Flip type (0=none, 2=ud, 3=lr).
+            scale (float): Scale factor.
+            img_size (tuple): Original image size (height, width).
+            dim (int): Dimension to split at.
+
+        Returns:
+            (torch.Tensor): De-scaled predictions.
+        """
+        p[:, :4] /= scale  # de-scale
+        x, y, wh, cls = p.split((1, 1, 2, p.shape[dim] - 4), dim)
+        if flips == 2:
+            y = img_size[0] - y  # de-flip ud
+        elif flips == 3:
+            x = img_size[1] - x  # de-flip lr
+        return torch.cat((x, y, wh, cls), dim)
+
+    def _clip_augmented(self, y):
+        """
+        Clip YOLO augmented inference tails.
+
+        Args:
+            y (list[torch.Tensor]): List of detection tensors.
+
+        Returns:
+            (list[torch.Tensor]): Clipped detection tensors.
+        """
+        nl = self.model[-1].nl  # number of detection layers (P3-P5)
+        g = sum(4**x for x in range(nl))  # grid points
+        e = 1  # exclude layer count
+        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))  # indices
+        y[0] = y[0][..., :-i]  # large
+        i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
+        y[-1] = y[-1][..., i:]  # small
+        return y
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        return SSTNDetectionLoss(self)
+
+
+class HCSYOLOModel(BaseModel):
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
+        """
+        Initialize the HCSYOLO detection model with the given config and parameters.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Whether to display model information.
+        """
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        # Define model
+        self.yaml["channels"] = ch  # save channels
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
+        self.end2end = getattr(self.model[-1], "end2end", False)
+
+        # Build strides
+        m = self.model[-1]  # Detect()
+        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+
+            def _forward(x):
+                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
+                if self.end2end:
+                    return self.forward(x)["one2many"]
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+
+            self.model.eval()  # Avoid changing batch statistics until training begins
+            m.training = True  # Setting it to True to properly return strides
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            self.stride = m.stride
+            self.model.train()  # Set model back to training(default) mode
+            m.bias_init()  # only run once
+        else:
+            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+
+        # Init weights, biases
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def _predict_augment(self, x):
+        """
+        Perform augmentations on input image x and return augmented inference and train outputs.
+
+        Args:
+            x (torch.Tensor): Input image tensor.
+
+        Returns:
+            (torch.Tensor): Augmented inference output.
+        """
+        if getattr(self, "end2end", False) or self.__class__.__name__ != "DetectionModel":
+            LOGGER.warning("Model does not support 'augment=True', reverting to single-scale prediction.")
+            return self._predict_once(x)
+        img_size = x.shape[-2:]  # height, width
+        s = [1, 0.83, 0.67]  # scales
+        f = [None, 3, None]  # flips (2-ud, 3-lr)
+        y = []  # outputs
+        for si, fi in zip(s, f):
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            yi = super().predict(xi)[0]  # forward
+            yi = self._descale_pred(yi, fi, si, img_size)
+            y.append(yi)
+        y = self._clip_augmented(y)  # clip augmented tails
+        return torch.cat(y, -1), None  # augmented inference, train
+    
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool): Print the computation time of each layer if True.
+            visualize (bool): Save the feature maps of the model if True.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        y, dt, embeddings = [], [], []  # outputs
+        embed = frozenset(embed) if embed is not None else {-1}
+        max_idx = max(embed)
+
+        prev_block_feats = []
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            if m.__class__.__name__ == "C2f_AttnRes" and m.use_attnres == False:
+                x = m(x)
+                prev_block_feats.append(x)
+            elif m.__class__.__name__ == "C2f_AttnRes":
+                x = m(x, prev_block_feats)
+            else:
+                x = m(x)
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if m.i in embed:
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max_idx:
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x
+
+    def loss(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on.
+            preds (torch.Tensor | list[torch.Tensor], optional): Predictions.
+        """
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        if preds is None:
+            preds = self.forward(batch["img"])
+        return self.criterion(preds, batch)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        return HCSYOLOLoss(self)
 
 class OBBModel(DetectionModel):
     """
@@ -1584,6 +1969,7 @@ def parse_model(d, ch, verbose=True):
             GhostBottleneck,
             SPP,
             SPPF,
+            GatedSPPF,
             C2fPSA,
             C2PSA,
             DWConv,
@@ -1592,7 +1978,18 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
+            C2fk,
+            C2f_AttnRes,
+            C3k2_AttnRes,
             C3k2,
+            # C2fSDSA,
+            WaveletDownsample,
+            WaveletDownsample1,
+            WaveletDownsample2,
+            CPSBlock,
+            SSTM,
+            SCJW,
+            FBDM,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1610,6 +2007,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            HTEM,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1618,12 +2016,17 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
+            C2fk,
             C3k2,
+            # C2fSDSA,
             C2fAttn,
+            C2f_AttnRes,
+            C3k2_AttnRes,
             C3,
             C3TR,
             C3Ghost,
             C3x,
+            CPSBlock,
             RepC3,
             C2fPSA,
             C2fCIB,
@@ -1668,6 +2071,9 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m in {Fusion_2in_mod, FEM, CS_AttnRes_Neck}:
+            c1, c2 = [ch[x] for x in f], make_divisible(min(args[0], max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]

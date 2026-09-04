@@ -1,5 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+import re
+
 import torch
 import torch.nn as nn
 
@@ -325,6 +327,389 @@ class TaskAlignedAssigner(nn.Module):
         # Find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
         return target_gt_idx, fg_mask, mask_pos
+    
+
+class NewTaskAlignedAssigner(TaskAlignedAssigner):
+    def __init__(self, topk=10, num_classes=80, alpha=0.5, beta=6.0):
+        super().__init__(topk, num_classes, alpha, beta)
+        # self.S0 = 128
+        self.S0 = 550.0  # VisDrone
+        # self.S0 = 256.0  # AIToD
+        self.k = 0.008  # steepness of sigmoid for Elastic Center Prior (ECP)
+        # self.k = 0.005  # steepness of sigmoid for Elastic Center Prior (ECP)
+        self.topk_low = 3 # minimum fusion weight for NPD
+        # self.topk_high = 6 # maximum fusion weight for NPD
+        self.topk_high = 10 # maximum fusion weight for NPD
+
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """
+        Compute the task-aligned assignment.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
+
+        Returns:
+            target_labels (torch.Tensor): Target labels with shape (bs, num_total_anchors).
+            target_bboxes (torch.Tensor): Target bounding boxes with shape (bs, num_total_anchors, 4).
+            target_scores (torch.Tensor): Target scores with shape (bs, num_total_anchors, num_classes).
+            fg_mask (torch.Tensor): Foreground mask with shape (bs, num_total_anchors).
+            target_gt_idx (torch.Tensor): Target ground truth indices with shape (bs, num_total_anchors).
+        """
+        mask_pos, align_metric, overlaps, gt_areas = self.get_pos_mask(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
+        )
+
+        target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes, gt_areas)
+        # target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
+
+        # Assigned target
+        target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+
+        # Normalize
+        align_metric *= mask_pos
+        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)  # b, max_num_obj
+        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
+        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
+        target_scores = target_scores * norm_align_metric
+
+        return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
+        
+    def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
+        """
+        Get positive mask for each ground truth box.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
+
+        Returns:
+            mask_pos (torch.Tensor): Positive mask with shape (bs, max_num_obj, h*w).
+            align_metric (torch.Tensor): Alignment metric with shape (bs, max_num_obj, h*w).
+            overlaps (torch.Tensor): Overlaps between predicted and ground truth boxes with shape (bs, max_num_obj, h*w).
+        """
+        expanded_gt_bboxes = self.expand_gt_boxes_pixel(gt_bboxes, S0=self.S0, k=self.k)
+        mask_in_gts = self.select_candidates_in_gts(anc_points, expanded_gt_bboxes)
+        # mask_in_gts1 = self.select_candidates_in_gts(anc_points, gt_bboxes)
+        # Get anchor_align metric, (b, max_num_obj, h*w)
+        align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
+        # Get topk_metric mask, (b, max_num_obj, h*w)
+        # mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
+        dynamic_k, gt_areas = self.get_dynamic_topk(gt_bboxes, mask_gt)
+        mask_topk = self.select_topk_candidates_dynamic(align_metric, dynamic_k, mask_gt)
+        # Merge all mask to a final mask, (b, max_num_obj, h*w)
+        mask_pos = mask_topk * mask_in_gts * mask_gt
+
+        return mask_pos, align_metric, overlaps, gt_areas
+
+    def get_dynamic_topk(self, gt_bboxes, mask_gt):
+        """根据 GT 面积计算动态 topk 值，面积越小 topk 越大"""
+        gt_areas = (gt_bboxes[..., 2] - gt_bboxes[..., 0]) * (gt_bboxes[..., 3] - gt_bboxes[..., 1])
+        # 线性映射：面积 0 → topk_high，面积 max_area → topk_low
+        ratio = torch.clamp(gt_areas / self.S0, 0.0, 1.0)
+        dynamic_k = self.topk_high - ratio * (self.topk_high - self.topk_low)
+        dynamic_k = dynamic_k.long() * mask_gt.squeeze(-1)  # 无效 GT 置 0
+        return dynamic_k, gt_areas  # [bs, n_max_boxes]
+
+    def select_topk_candidates_dynamic(self, metrics, k_values, topk_mask=None):
+        """
+        在原 select_topk_candidates 基础上改造，支持每个 GT 使用不同的 topk 值。
+
+        Args:
+            metrics (torch.Tensor): (b, max_num_obj, h*w) 对齐度量分数。
+            k_values (torch.Tensor): (b, max_num_obj) 整数张量，每个 GT 的动态 topk 值。
+            topk_mask (torch.Tensor, optional): 形状 (b, max_num_obj, max_k) 的布尔掩码，用于过滤无效候选。
+
+        Returns:
+            (torch.Tensor): (b, max_num_obj, h*w) 的 0/1 掩码，表示被选中的候选锚点。
+        """
+        # 确定本次计算的最大 k 值（用于确定取多少个 topk 索引）
+        max_k = int(k_values.max().item())
+        if max_k == 0:
+            return torch.zeros_like(metrics, dtype=metrics.dtype)
+
+        # 1. 取出全局最大 k 个候选索引（多取一些，后面根据各 GT 的 k 值截断）
+        #    topk_idxs: (b, max_num_obj, max_k)
+        topk_metrics, topk_idxs = torch.topk(metrics, max_k, dim=-1, largest=True)
+
+        # 2. 处理 topk_mask（若未提供则根据得分阈值自动生成）
+        if topk_mask is None:
+            # 原逻辑：保留那些最大得分 > eps 的 GT
+            topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
+        # 确保 topk_mask 形状与 topk_idxs 一致 (b, max_num_obj, max_k)
+        topk_idxs.masked_fill_(~(topk_mask.expand(-1, -1, max_k).bool()), 0)
+
+        # 3. 初始化计数张量
+        count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=topk_idxs.device)
+        ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8, device=topk_idxs.device)
+
+        # 4. 逐 k 循环（最多循环 max_k 次）
+        for k in range(max_k):
+            # 构造当前 k 位置的有效性掩码：只有 k < 该 GT 的 k_values 时才执行 scatter_add
+            # valid_mask: (b, max_num_obj, 1) 布尔型，True 表示该 GT 的 topk 包含第 k 个候选
+            valid_mask = (k < k_values).unsqueeze(-1)  # (b, max_num_obj, 1)
+
+            # 将 valid_mask 与当前 k 对应的 topk_idxs 切片结合
+            # 只对有效位置进行 scatter_add
+            idx_slice = topk_idxs[:, :, k:k+1]  # (b, max_num_obj, 1)
+
+            # 使用 masked_scatter 或逐元素操作：这里采用 torch.where 生成带条件的 ones
+            # 当 valid_mask 为 False 时，将 ones 置零，避免错误累加
+            masked_ones = ones * valid_mask.to(ones.dtype)
+
+            # 累加到计数张量
+            count_tensor.scatter_add_(-1, idx_slice, masked_ones)
+
+        # 5. 过滤无效边界框（若某个锚点被同一 GT 多次选中，置 0）
+        count_tensor.masked_fill_(count_tensor > 1, 0)
+
+        return count_tensor.to(metrics.dtype)
+    
+    @staticmethod
+    def select_highest_overlaps(mask_pos, overlaps, n_max_boxes, gt_areas):
+        """
+        尺度感知冲突解决：优先将锚点分配给面积较小的 GT。
+
+        Args:
+            mask_pos: (b, n_max_boxes, na)
+            overlaps: (b, n_max_boxes, na) CIoU
+            n_max_boxes: int
+            gt_areas: (b, n_max_boxes) GT 面积
+            scale_alpha: 尺度优先强度，0 表示退化为原版
+        """
+        fg_mask = mask_pos.sum(-2)  # (b, na)
+        if fg_mask.max() > 1:
+            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)
+
+            # 计算尺度权重：面积越小，权重越高
+            # 对面积做归一化，防止量纲影响
+            norm_areas = gt_areas / (gt_areas.max(dim=1, keepdim=True)[0] + 1e-6)  # (b, n_max_boxes)
+            scale_weight = 1.0 / (norm_areas.unsqueeze(-1) + 1e-6) ** 0.5   # (b, n_max_boxes, 1)
+
+            weighted_overlaps = overlaps * scale_weight
+
+            max_idx = weighted_overlaps.argmax(1)  # (b, na)
+
+            is_max = torch.zeros_like(mask_pos)
+            is_max.scatter_(1, max_idx.unsqueeze(1), 1)
+
+            mask_pos = torch.where(mask_multi_gts, is_max, mask_pos)
+            fg_mask = mask_pos.sum(-2)
+
+        target_gt_idx = mask_pos.argmax(-2)
+        return target_gt_idx, fg_mask, mask_pos
+    
+    # def select_topk_candidates_dynamic(self, metrics, gt_bboxes, mask_gt):
+    #     """
+    #     对每个 GT 独立计算动态 k 值，并选择 Top-K。
+    #     Args:
+    #         metrics: (bs, n_gt, na)  对齐度量
+    #         gt_bboxes: (bs, n_gt, 4) [x1,y1,x2,y2]
+    #         mask_gt: (bs, n_gt, 1)   有效GT掩码
+    #     Returns:
+    #         mask_topk: (bs, n_gt, na) 二值掩码，1表示被选为正样本
+    #     """
+    #     bs, n_gt, na = metrics.shape
+    #     device = metrics.device
+
+    #     # 计算每个 GT 的面积 (像素)
+    #     w = gt_bboxes[..., 2] - gt_bboxes[..., 0]   # (bs, n_gt)
+    #     h = gt_bboxes[..., 3] - gt_bboxes[..., 1]
+    #     area_gt = w * h + self.eps                   # 避免除零
+
+    #     # 动态 k 值: k = base * (area_ref / area)^gamma
+    #     ratio = self.S0 / area_gt
+    #     k_dynamic = self.topk * (ratio ** 0.4)
+    #     k_dynamic = torch.clamp(k_dynamic, self.k_min, self.k_max).long()  # (bs, n_gt)
+    #     max_k = k_dynamic.max().item()
+
+    #     # 对所有 GT 取 Top-max_k，得到指标和索引
+    #     topk_metrics, topk_idxs = torch.topk(metrics, max_k, dim=-1, largest=True)  # (bs, n_gt, max_k)
+    #     if mask_gt is None:
+    #         mask_gt = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
+
+    #     # 生成有效掩码：每个 GT 只有前 k_dynamic 个有效
+    #     k_mask = torch.arange(max_k, device=device).view(1, 1, max_k) < k_dynamic.unsqueeze(-1)  # (bs, n_gt, max_k)
+    #     topk_idxs = topk_idxs.masked_fill(~k_mask, 0)
+
+    #     # 构建 count_tensor (与原始 TAL 一致)
+    #     count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=device)
+    #     ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8)
+    #     for k_idx in range(max_k):
+    #         count_tensor.scatter_add_(-1, topk_idxs[:, :, k_idx:k_idx+1], ones)
+    #     # 过滤掉重复分配的 anchor (一个 anchor 被多个 GT 选中)
+    #     count_tensor.masked_fill_(count_tensor > 1, 0)
+
+    #     return count_tensor.to(metrics.dtype)
+    
+    def expand_gt_boxes_pixel(self, gt_bboxes, delta_min=0.05, delta_max=0.30, S0=1024, k=None):
+        """
+        Elastic Center Prior (ECP): Expand ground truth boxes based on absolute pixel area.
+
+        This function performs scale-adaptive expansion of GT boxes to increase candidate
+        anchor points for small objects, without requiring explicit image dimensions.
+        Clipping to image boundaries is omitted as out-of-bounds expansion does not
+        introduce any valid anchor points (anchors always reside within the image).
+
+        Args:
+            gt_bboxes (Tensor): shape (bs, n_max, 4) in pixel coordinates (x1, y1, x2, y2).
+            delta_min (float): minimum expansion ratio (for large objects).
+            delta_max (float): maximum expansion ratio (for extremely small objects).
+            S0 (float): area threshold (pixels²), COCO small object boundary (32x32 = 1024).
+            k (float, optional): steepness of the sigmoid transition. If None, defaults to 2/S0.
+
+        Returns:
+            Tensor: expanded gt_bboxes, same shape and device as input.
+        """
+        if k is None:
+            k = 2.0 / S0  # smooth transition over [0, 2*S0]
+
+        w = gt_bboxes[..., 2] - gt_bboxes[..., 0]
+        h = gt_bboxes[..., 3] - gt_bboxes[..., 1]
+        area = w * h  # (bs, n_max), in pixels²
+
+        # Sigmoid expansion factor (Equation 1)
+        delta = delta_min + (delta_max - delta_min) / (1.0 + torch.exp(k * (area - S0)))
+        # Clamp to valid range for numerical stability
+        delta = torch.clamp(delta, delta_min, delta_max)
+
+        dw = delta * w
+        dh = delta * h
+
+        expanded = gt_bboxes.clone()
+        expanded[..., 0] = gt_bboxes[..., 0] - dw
+        expanded[..., 1] = gt_bboxes[..., 1] - dh
+        expanded[..., 2] = gt_bboxes[..., 2] + dw
+        expanded[..., 3] = gt_bboxes[..., 3] + dh
+
+        # Note: no explicit clipping to image boundaries is performed.
+        # Expanded regions outside the image will never contain any anchor points,
+        # thus they do not affect the final assignment result.
+
+        return expanded
+
+    def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
+        """
+        Compute alignment metric given predicted and ground truth bounding boxes.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, h*w).
+
+        Returns:
+            align_metric (torch.Tensor): Alignment metric combining classification and localization.
+            overlaps (torch.Tensor): IoU overlaps between predicted and ground truth boxes.
+        """
+        na = pd_bboxes.shape[-2]
+        mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
+        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+
+        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
+        ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
+        ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
+        # Get the scores of each grid for each gt cls
+        bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
+
+        # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
+        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
+        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
+        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
+
+        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
+        return align_metric, overlaps
+    
+    def npd_similarity(self, gt_boxes, pd_boxes, eps=1e-7):
+        """
+        Compute Normalized Projection Distance similarity between two sets of boxes.
+        Boxes are in (x1, y1, x2, y2) format.
+        
+        Args:
+            gt_boxes (Tensor): shape (..., 4)
+            pd_boxes (Tensor): shape (..., 4)
+            eps (float): small constant for numerical stability.
+        
+        Returns:
+            Tensor: NPD similarity, shape gt_boxes.shape[:-1]
+        """
+        # Intersection limits
+        inter_x1 = torch.max(gt_boxes[..., 0], pd_boxes[..., 0])
+        inter_y1 = torch.max(gt_boxes[..., 1], pd_boxes[..., 1])
+        inter_x2 = torch.min(gt_boxes[..., 2], pd_boxes[..., 2])
+        inter_y2 = torch.min(gt_boxes[..., 3], pd_boxes[..., 3])
+
+        # Outer bounding box limits (union of extents)
+        outer_x1 = torch.min(gt_boxes[..., 0], pd_boxes[..., 0])
+        outer_y1 = torch.min(gt_boxes[..., 1], pd_boxes[..., 1])
+        outer_x2 = torch.max(gt_boxes[..., 2], pd_boxes[..., 2])
+        outer_y2 = torch.max(gt_boxes[..., 3], pd_boxes[..., 3])
+
+        # Widths and heights
+        inter_w = (inter_x2 - inter_x1).clamp(min=0)
+        inter_h = (inter_y2 - inter_y1).clamp(min=0)
+        outer_w = (outer_x2 - outer_x1).clamp(min=eps)
+        outer_h = (outer_y2 - outer_y1).clamp(min=eps)
+
+        overlap_x = inter_w / outer_w
+        overlap_y = inter_h / outer_h
+
+        npd = overlap_x * overlap_y
+
+        # # 引入中心距离约束
+        # gt_center_x = (gt_boxes[..., 0] + gt_boxes[..., 2]) / 2
+        # gt_center_y = (gt_boxes[..., 1] + gt_boxes[..., 3]) / 2
+        # pd_center_x = (pd_boxes[..., 0] + pd_boxes[..., 2]) / 2
+        # pd_center_y = (pd_boxes[..., 1] + pd_boxes[..., 3]) / 2
+        # dist_center = torch.sqrt((gt_center_x - pd_center_x)**2 + (gt_center_y - pd_center_y)**2)
+        # max_size = torch.max(outer_w, outer_h)
+        # center_penalty = torch.exp(-dist_center**2 / (2 * max_size**2))  # 高斯惩罚
+
+        return npd
+    
+    def nwd_similarity(self, 
+                       gt_boxes, 
+                       pd_boxes, 
+                       ):
+        """
+        动态归一化的 NWD 相似度。
+        gt_boxes, pd_boxes: (..., 4) [x1,y1,x2,y2]
+        返回: (..., ) 相似度，范围 (0,1]
+        """
+        # 转换为中心宽高
+        gt_cx = (gt_boxes[..., 0] + gt_boxes[..., 2]) / 2
+        gt_cy = (gt_boxes[..., 1] + gt_boxes[..., 3]) / 2
+        gt_w = (gt_boxes[..., 2] - gt_boxes[..., 0]).clamp(min=self.eps)
+        gt_h = (gt_boxes[..., 3] - gt_boxes[..., 1]).clamp(min=self.eps)
+
+        pd_cx = (pd_boxes[..., 0] + pd_boxes[..., 2]) / 2
+        pd_cy = (pd_boxes[..., 1] + pd_boxes[..., 3]) / 2
+        pd_w = (pd_boxes[..., 2] - pd_boxes[..., 0]).clamp(min=self.eps)
+        pd_h = (pd_boxes[..., 3] - pd_boxes[..., 1]).clamp(min=self.eps)
+
+        # 中心距离平方
+        center_dist2 = (gt_cx - pd_cx) ** 2 + (gt_cy - pd_cy) ** 2
+        # 半宽高差平方
+        w_half_diff = (gt_w - pd_w) / 2
+        h_half_diff = (gt_h - pd_h) / 2
+        w2_sq = center_dist2 + w_half_diff ** 2 + h_half_diff ** 2
+        w2 = torch.sqrt(w2_sq + self.eps)   # Wasserstein 距离
+
+        # 动态归一化：以 GT 框的半对角线长度为尺度
+        gt_scale = torch.sqrt(gt_w * gt_h)
+        norm_scale = self.alpha_nwd * gt_scale.clamp(min=self.eps)
+        sim = torch.exp(-w2 / (norm_scale + self.eps))
+        return sim
 
 
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):

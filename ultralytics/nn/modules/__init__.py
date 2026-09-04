@@ -38,6 +38,7 @@ from .block import (
     Bottleneck,
     BottleneckCSP,
     C2f,
+    C2fk,
     C2fAttn,
     C2fCIB,
     C2fPSA,
@@ -59,6 +60,10 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    FEM,
+    HTEM,
+    Fusion_2in_mod,
+    GatedSPPF,
 )
 from .conv import (
     CBAM,
@@ -75,6 +80,7 @@ from .conv import (
     LightConv,
     RepConv,
     SpatialAttention,
+    h_sigmoid,
 )
 from .head import (
     OBB,
@@ -101,6 +107,12 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .scjw import SCJW
+from .cps import CPSBlock
+from .sdsa import C2fSDSA
+from .fbdm import FBDM
+from .csattnres import CS_AttnRes_Neck, C2f_AttnRes, C3k2_AttnRes, WaveletDownsample, WaveletDownsample1
+
 
 __all__ = (
     "AIFI",
@@ -127,6 +139,11 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
+    "C2fk",
+    "C2f_AttnRes",
+    "C3k2_AttnRes",
+    "C2fSDSA",
+    "CS_AttnRes_Neck",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -142,12 +159,14 @@ __all__ = (
     "Conv",
     "Conv2",
     "ConvTranspose",
+    "CPSBlock",
     "DWConv",
     "DWConvTranspose2d",
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
     "Focus",
+    "FBDM",
     "GhostBottleneck",
     "GhostConv",
     "HGBlock",
@@ -169,9 +188,17 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "WaveletDownsample",
+    "WaveletDownsample1",
+    "WaveletDownsample2",
+    "SCJW",
     "Segment",
     "SpatialAttention",
     "TorchVision",
+    "FEM",
+    "HTEM",
+    "Fusion_2in_mod",
+    "GatedSPPF",
     "TransformerBlock",
     "TransformerEncoderLayer",
     "TransformerLayer",

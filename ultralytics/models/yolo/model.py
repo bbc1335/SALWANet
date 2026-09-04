@@ -13,6 +13,8 @@ from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
+    SSTNModel,
+    HCSYOLOModel,
     OBBModel,
     PoseModel,
     SegmentationModel,
@@ -53,40 +55,57 @@ class YOLO(Model):
 
     def __init__(self, model: str | Path = "yolo11n.pt", task: str | None = None, verbose: bool = False):
         """
-        Initialize a YOLO model.
+        初始化YOLO模型，支持自动模型类型检测与切换。
 
-        This constructor initializes a YOLO model, automatically switching to specialized model types
-        (YOLOWorld or YOLOE) based on the model filename.
+        该构造函数初始化YOLO模型实例，并根据模型文件名自动切换到专用模型类型：
+        - 若模型文件名包含"-world"，则自动切换到YOLOWorld模型
+        - 若模型文件名包含"yoloe"，则自动切换到YOLOE模型
+        - 若检测到RTDETR模型头，则自动切换到RTDETR模型
+        - 否则使用默认YOLO模型初始化
 
-        Args:
-            model (str | Path): Model name or path to model file, i.e. 'yolo11n.pt', 'yolo11n.yaml'.
-            task (str, optional): YOLO task specification, i.e. 'detect', 'segment', 'classify', 'pose', 'obb'.
-                Defaults to auto-detection based on model.
-            verbose (bool): Display model info on load.
+        参数:
+            model (str | Path): 模型名称或路径，例如 'yolo11n.pt', 'yolo11n.yaml'
+            task (str, optional): YOLO任务类型，可选值：'detect', 'segment', 'classify', 'pose', 'obb'
+                默认为None，将根据模型自动检测任务类型
+            verbose (bool): 加载模型时是否显示详细信息
 
-        Examples:
+        示例:
             >>> from ultralytics import YOLO
-            >>> model = YOLO("yolo11n.pt")  # load a pretrained YOLOv11n detection model
-            >>> model = YOLO("yolo11n-seg.pt")  # load a pretrained YOLO11n segmentation model
+            >>> model = YOLO("yolo11n.pt")  # 加载预训练的YOLOv11n检测模型
+            >>> model = YOLO("yolo11n-seg.pt")  # 加载预训练的YOLO11n分割模型
+            >>> model = YOLO("yolo11n-world.pt")  # 自动切换为YOLOWorld模型
+            >>> model = YOLO("yoloe-s.pt")  # 自动切换为YOLOE模型
         """
+        # 将模型参数转换为Path对象以便处理
         path = Path(model if isinstance(model, (str, Path)) else "")
-        if "-world" in path.stem and path.suffix in {".pt", ".yaml", ".yml"}:  # if YOLOWorld PyTorch model
+        
+        # 检测是否为YOLOWorld模型（文件名包含"-world"且为支持的文件格式）
+        if "-world" in path.stem and path.suffix in {".pt", ".yaml", ".yml"}:
+            # 创建YOLOWorld实例并动态切换当前对象的类型
             new_instance = YOLOWorld(path, verbose=verbose)
-            self.__class__ = type(new_instance)
-            self.__dict__ = new_instance.__dict__
-        elif "yoloe" in path.stem and path.suffix in {".pt", ".yaml", ".yml"}:  # if YOLOE PyTorch model
+            self.__class__ = type(new_instance)  # 切换类类型
+            self.__dict__ = new_instance.__dict__  # 复制属性
+        
+        # 检测是否为YOLOE模型（文件名包含"yoloe"且为支持的文件格式）
+        elif "yoloe" in path.stem and path.suffix in {".pt", ".yaml", ".yml"}:
+            # 创建YOLOE实例并动态切换当前对象的类型
             new_instance = YOLOE(path, task=task, verbose=verbose)
-            self.__class__ = type(new_instance)
-            self.__dict__ = new_instance.__dict__
+            self.__class__ = type(new_instance)  # 切换类类型
+            self.__dict__ = new_instance.__dict__  # 复制属性
+        
+        # 默认YOLO模型初始化流程
         else:
-            # Continue with default YOLO initialization
+            # 调用父类Model的初始化方法
             super().__init__(model=model, task=task, verbose=verbose)
-            if hasattr(self.model, "model") and "RTDETR" in self.model.model[-1]._get_name():  # if RTDETR head
-                from ultralytics import RTDETR
-
+            
+            # 检测是否为RTDETR模型头（检查最后一层的名称是否包含"RTDETR"）
+            if hasattr(self.model, "model") and "RTDETR" in self.model.model[-1]._get_name():
+                from ultralytics import RTDETR  # 延迟导入RTDETR模块
+                
+                # 创建RTDETR实例并动态切换当前对象的类型
                 new_instance = RTDETR(self)
-                self.__class__ = type(new_instance)
-                self.__dict__ = new_instance.__dict__
+                self.__class__ = type(new_instance)  # 切换类类型
+                self.__dict__ = new_instance.__dict__  # 复制属性
 
     @property
     def task_map(self) -> dict[str, dict[str, Any]]:
@@ -121,6 +140,95 @@ class YOLO(Model):
                 "trainer": yolo.obb.OBBTrainer,
                 "validator": yolo.obb.OBBValidator,
                 "predictor": yolo.obb.OBBPredictor,
+            },
+        }
+
+
+class SSTN(Model):
+    """
+    YOLO (You Only Look Once) object detection model.
+
+    This class provides a unified interface for YOLO models, automatically switching to specialized model types
+    (YOLOWorld or YOLOE) based on the model filename. It supports various computer vision tasks including object
+    detection, segmentation, classification, pose estimation, and oriented bounding box detection.
+
+    Attributes:
+        model: The loaded YOLO model instance.
+        task: The task type (detect, segment, classify, pose, obb).
+        overrides: Configuration overrides for the model.
+
+    Methods:
+        __init__: Initialize a YOLO model with automatic type detection.
+        task_map: Map tasks to their corresponding model, trainer, validator, and predictor classes.
+
+    Examples:
+        Load a pretrained YOLOv11n detection model
+        >>> model = YOLO("yolo11n.pt")
+
+        Load a pretrained YOLO11n segmentation model
+        >>> model = YOLO("yolo11n-seg.pt")
+
+        Initialize from a YAML configuration
+        >>> model = YOLO("yolo11n.yaml")
+    """
+
+    def __init__(self, model: str | Path = "yolo11n.pt", task: str | None = None, verbose: bool = False):
+        """
+        初始化YOLO模型，支持自动模型类型检测与切换。
+
+        该构造函数初始化YOLO模型实例，并根据模型文件名自动切换到专用模型类型：
+        - 若模型文件名包含"-world"，则自动切换到YOLOWorld模型
+        - 若模型文件名包含"yoloe"，则自动切换到YOLOE模型
+        - 若检测到RTDETR模型头，则自动切换到RTDETR模型
+        - 否则使用默认YOLO模型初始化
+
+        参数:
+            model (str | Path): 模型名称或路径，例如 'yolo11n.pt', 'yolo11n.yaml'
+            task (str, optional): YOLO任务类型，可选值：'detect', 'segment', 'classify', 'pose', 'obb'
+                默认为None，将根据模型自动检测任务类型
+            verbose (bool): 加载模型时是否显示详细信息
+
+        示例:
+            >>> from ultralytics import YOLO
+            >>> model = YOLO("yolo11n.pt")  # 加载预训练的YOLOv11n检测模型
+            >>> model = YOLO("yolo11n-seg.pt")  # 加载预训练的YOLO11n分割模型
+            >>> model = YOLO("yolo11n-world.pt")  # 自动切换为YOLOWorld模型
+            >>> model = YOLO("yoloe-s.pt")  # 自动切换为YOLOE模型
+        """
+        # 将模型参数转换为Path对象以便处理
+        path = Path(model if isinstance(model, (str, Path)) else "")
+        # 调用父类Model的初始化方法
+        super().__init__(model=model, task=task, verbose=verbose)
+
+    @property
+    def task_map(self) -> dict[str, dict[str, Any]]:
+        """Map head to model, trainer, validator, and predictor classes."""
+        return {
+            "detect": {
+                "model": SSTNModel,
+                "trainer": yolo.detect.SSTNTrainer,
+                "validator": yolo.detect.DetectionValidator,
+                "predictor": yolo.detect.DetectionPredictor,
+            },
+        }
+
+
+class SALWANet(Model):
+    def __init__(self, model: str | Path = "yolo11n.pt", task: str | None = None, verbose: bool = False):
+        # 将模型参数转换为Path对象以便处理
+        path = Path(model if isinstance(model, (str, Path)) else "")
+        # 调用父类Model的初始化方法
+        super().__init__(model=model, task=task, verbose=verbose)
+
+    @property
+    def task_map(self) -> dict[str, dict[str, Any]]:
+        """Map head to model, trainer, validator, and predictor classes."""
+        return {
+            "detect": {
+                "model": HCSYOLOModel,
+                "trainer": yolo.detect.HCSYOLOTrainer,
+                "validator": yolo.detect.DetectionValidator,
+                "predictor": yolo.detect.DetectionPredictor,
             },
         }
 
