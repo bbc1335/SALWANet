@@ -187,7 +187,6 @@ __all__ = (
     "WaveletDownsample",
     "WaveletDownsample1",
     "WaveletDownsample2",
-    "SCJW",
     "Segment",
     "SpatialAttention",
     "TorchVision",

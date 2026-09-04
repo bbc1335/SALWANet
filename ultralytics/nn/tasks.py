@@ -33,10 +33,7 @@ from ultralytics.nn.modules import (
     C2fk,
     C2f_AttnRes,
     C3k2_AttnRes,
-    # C2fSDSA,
     WaveletDownsample,
-    WaveletDownsample1,
-    CS_AttnRes_Neck,
     C2fAttn,
     C2fCIB,
     C2fPSA,
@@ -50,12 +47,10 @@ from ultralytics.nn.modules import (
     Conv,
     Conv2,
     ConvTranspose,
-    CPSBlock,
     Detect,
     DWConv,
     DWConvTranspose2d,
     Focus,
-    FBDM,
     GhostBottleneck,
     GhostConv,
     HGBlock,
@@ -83,8 +78,6 @@ from ultralytics.nn.modules import (
     v10Detect,
 )
 from ultralytics.nn.modules.csattnres import WaveletDownsample2
-from ultralytics.nn.modules.scjw import SCJW
-from ultralytics.nn.modules.sstm import SSTM
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -1984,12 +1977,6 @@ def parse_model(d, ch, verbose=True):
             C3k2,
             # C2fSDSA,
             WaveletDownsample,
-            WaveletDownsample1,
-            WaveletDownsample2,
-            CPSBlock,
-            SSTM,
-            SCJW,
-            FBDM,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -2026,7 +2013,6 @@ def parse_model(d, ch, verbose=True):
             C3TR,
             C3Ghost,
             C3x,
-            CPSBlock,
             RepC3,
             C2fPSA,
             C2fCIB,
@@ -2071,7 +2057,7 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
-        elif m in {Fusion_2in_mod, FEM, CS_AttnRes_Neck}:
+        elif m in {Fusion_2in_mod, FEM}:
             c1, c2 = [ch[x] for x in f], make_divisible(min(args[0], max_channels) * width, 8)
             args = [c1, c2, *args[1:]]
         elif m in frozenset({HGStem, HGBlock}):
