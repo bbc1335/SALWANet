@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -18,12 +19,11 @@ def torch2onnx(
     im: torch.Tensor,
     onnx_file: str,
     opset: int = 14,
-    input_names: list[str] = ["images"],
-    output_names: list[str] = ["output0"],
+    input_names: list[str] | None = None,
+    output_names: list[str] | None = None,
     dynamic: bool | dict = False,
 ) -> None:
-    """
-    Export a PyTorch model to ONNX format.
+    """Export a PyTorch model to ONNX format.
 
     Args:
         torch_model (torch.nn.Module): The PyTorch model to export.
@@ -37,6 +37,10 @@ def torch2onnx(
     Notes:
         Setting `do_constant_folding=True` may cause issues with DNN inference for torch>=1.12.
     """
+    if output_names is None:
+        output_names = ["output0"]
+    if input_names is None:
+        input_names = ["images"]
     kwargs = {"dynamo": False} if TORCH_2_4 else {}
     torch.onnx.export(
         torch_model,
@@ -66,8 +70,7 @@ def onnx2engine(
     verbose: bool = False,
     prefix: str = "",
 ) -> None:
-    """
-    Export a YOLO model to TensorRT engine format.
+    """Export a YOLO model to TensorRT engine format.
 
     Args:
         onnx_file (str): Path to the ONNX file to be converted.
@@ -156,8 +159,7 @@ def onnx2engine(
         config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
 
         class EngineCalibrator(trt.IInt8Calibrator):
-            """
-            Custom INT8 calibrator for TensorRT engine optimization.
+            """Custom INT8 calibrator for TensorRT engine optimization.
 
             This calibrator provides the necessary interface for TensorRT to perform INT8 quantization calibration
             using a dataset. It handles batch generation, caching, and calibration algorithm selection.

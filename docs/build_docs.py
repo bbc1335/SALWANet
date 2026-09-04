@@ -157,7 +157,6 @@ def update_markdown_files(md_filepath: Path):
 
         # Save page
         md_filepath.write_text(content)
-    return
 
 
 def update_docs_html():
@@ -262,8 +261,7 @@ def remove_macros():
 
 
 def remove_comments_and_empty_lines(content: str, file_type: str) -> str:
-    """
-    Remove comments and empty lines from a string of code, preserving newlines and URLs.
+    """Remove comments and empty lines from a string of code, preserving newlines and URLs.
 
     Args:
         content (str): Code content to process.
