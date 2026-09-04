@@ -107,7 +107,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-from .csattnres import CS_AttnRes_Neck, C2f_AttnRes, C3k2_AttnRes, WaveletDownsample, WaveletDownsample1
+from .csattnres import  C2f_AttnRes, C3k2_AttnRes, WaveletDownsample
 
 
 __all__ = (
